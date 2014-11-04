@@ -215,6 +215,13 @@
     return RLMSchema.sharedSchema[self.className];
 }
 
+- (NSString *)debugSummary {
+    if (self.isDeletedFromRealm) {
+        return @"[Deleted object]";
+    }
+    return nil;
+}
+
 - (NSString *)description
 {
     if (self.isDeletedFromRealm) {
