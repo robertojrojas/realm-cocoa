@@ -105,10 +105,12 @@
             // FIXME: support other types
             tightdb::Table *table = objectSchema.table;
             NSUInteger count = table->size();
+
+            if (!table->has_search_index(primaryProperty.column)) {
+                table->add_search_index(primaryProperty.column);
+            }
+
             if (primaryProperty.type == RLMPropertyTypeString) {
-                if (!table->has_search_index(primaryProperty.column)) {
-                    table->add_search_index(primaryProperty.column);
-                }
                 if (table->get_distinct_view(primaryProperty.column).size() != count) {
                     NSString *reason = [NSString stringWithFormat:@"Primary key property '%@' has duplicate values after migration.", primaryProperty.name];
                     @throw [NSException exceptionWithName:@"RLMException" reason:reason userInfo:nil];
