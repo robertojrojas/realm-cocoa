@@ -37,6 +37,19 @@
 #include <tightdb/commit_log.hpp>
 #include <tightdb/lang_bind_helper.hpp>
 
+using namespace std;
+using namespace tightdb;
+using namespace tightdb::util;
+
+// A thread which waits for change notifications on the given path and notifies
+// all registered RLMRealms when a change occurs. Does *not* retain registered
+// RLMRealm instances
+@interface RLMChangeListener : NSThread
+- (instancetype)initWithPath:(NSString *)path inMemory:(BOOL)inMemory;
+- (void)addRealm:(RLMRealm *)realm;
+- (void)removeRealm:(RLMRealm *)realm;
+@end
+
 // Notification Token
 
 @interface RLMNotificationToken ()
@@ -58,8 +71,6 @@
 // A weak holder for an RLMRealm to allow calling performSelector:onThread: without
 // a strong reference to the realm
 @interface RLMWeakNotifier : NSObject
-@property (nonatomic, weak) RLMRealm *realm;
-
 - (instancetype)initWithRealm:(RLMRealm *)realm;
 - (void)notify;
 @end
@@ -117,6 +128,7 @@ NSArray *realmsAtPath(NSString *path) {
     }
 }
 
+NSMutableDictionary *s_listenersPerPath;
 void clearRealmCache() {
     @synchronized(s_realmsPerPath) {
         for (NSMapTable *map in s_realmsPerPath.allValues) {
@@ -129,9 +141,18 @@ void clearRealmCache() {
     }
 }
 
-static NSString *s_defaultRealmPath = nil;
-static RLMMigrationBlock s_migrationBlock;
-static NSUInteger s_currentSchemaVersion = 0;
+RLMChangeListener *listenerForPath(NSString *path, BOOL inMemory, BOOL create=YES) {
+    RLMChangeListener *listener = s_listenersPerPath[path];
+    if (!listener && create) {
+        listener = [[RLMChangeListener alloc] initWithPath:path inMemory:inMemory];
+        s_listenersPerPath[path] = listener;
+    }
+    return listener;
+}
+
+NSString *s_defaultRealmPath = nil;
+RLMMigrationBlock s_migrationBlock;
+NSUInteger s_currentSchemaVersion = 0;
 
 void createTablesInTransaction(RLMRealm *realm, RLMSchema *targetSchema) {
     [realm beginWriteTransaction];
@@ -170,11 +191,11 @@ bool isDebuggerAttached() {
     return (info.kp_proc.p_flag & P_TRACED) != 0;
 }
 
+NSString * const c_defaultRealmFileName = @"default.realm";
 } // anonymous namespace
 
-NSString * const c_defaultRealmFileName = @"default.realm";
-
 @implementation RLMRealm {
+@public
     // Used for read-write realms
     NSThread *_thread;
     NSMapTable *_notificationHandlers;
@@ -206,6 +227,7 @@ NSString * const c_defaultRealmFileName = @"default.realm";
     RLMCheckForUpdates();
 
     // initilize realm cache
+    s_listenersPerPath = [NSMutableDictionary new];
     clearRealmCache();
 }
 
@@ -461,6 +483,13 @@ NSString * const c_defaultRealmFileName = @"default.realm";
             // cache only realms using a shared schema
             cacheRealm(realm, path);
         }
+
+    }
+
+    if (!readonly) {
+        @synchronized(s_listenersPerPath) {
+            [listenerForPath(path, inMemory) addRealm:realm];
+        }
     }
 
     return realm;
@@ -577,16 +606,6 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
             // update state and make all objects in this realm read-only
             _inWriteTransaction = NO;
 
-            // notify other realm instances of changes
-            NSArray *realms = realmsAtPath(_path);
-            for (RLMRealm *realm in realms) {
-                if (![realm isEqual:self]) {
-                    RLMWeakNotifier *notifier = [[RLMWeakNotifier alloc] initWithRealm:realm];
-                    [notifier performSelector:@selector(notify)
-                                     onThread:realm->_thread withObject:nil waitUntilDone:NO];
-                }
-            }
-
             // send local notification
             [self sendNotifications:RLMRealmDidChangeNotification];
         }
@@ -640,6 +659,9 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
         NSLog(@"WARNING: An RLMRealm instance was deallocated during a write transaction and all "
               "pending changes have been rolled back. Make sure to retain a reference to the "
               "RLMRealm for the duration of the write transaction.");
+    }
+    @synchronized(s_listenersPerPath) {
+        [listenerForPath(_path, NO, NO) removeRealm:self];
     }
 }
 
@@ -873,18 +895,124 @@ static void CheckReadWrite(RLMRealm *realm, NSString *msg=@"Cannot write to a re
 
 @end
 
-@implementation RLMWeakNotifier
+@implementation RLMWeakNotifier {
+    __weak RLMRealm *_realm;
+    // flag used to avoid queuing up redundant notifications
+    std::atomic_flag _hasPendingNotification;
+}
+
 - (instancetype)initWithRealm:(RLMRealm *)realm
 {
     self = [super init];
     if (self) {
         _realm = realm;
+        _hasPendingNotification.clear();
     }
     return self;
 }
 
 - (void)notify
 {
+    _hasPendingNotification.clear();
     [_realm handleExternalCommit];
+}
+
+- (void)notifyOnTargetThread
+{
+    // autorelease so that if we happen to be the last ones holding a strong
+    // reference the RLMRealm will be released *after* _sharedGroupCondition
+    // is unlocked, avoiding a deadlock
+    __autoreleasing RLMRealm *realm = _realm;
+    if (realm && !_hasPendingNotification.test_and_set()) {
+        [self performSelector:@selector(notify)
+                     onThread:realm->_thread withObject:nil waitUntilDone:NO];
+    }
+}
+@end
+
+@implementation RLMChangeListener {
+    std::unique_ptr<Replication> _replication;
+    std::unique_ptr<SharedGroup> _sharedGroup;
+    NSString *_path;
+    NSMutableArray *_realms;
+    NSCondition *_sharedGroupCondition;
+}
+
+- (instancetype)initWithPath:(NSString *)path inMemory:(BOOL)inMemory {
+    self = [super initWithTarget:self selector:@selector(run) object:nil];
+    if (self) {
+        _replication.reset(tightdb::makeWriteLogCollector(path.UTF8String));
+        SharedGroup::DurabilityLevel durability = inMemory ? SharedGroup::durability_MemOnly :
+                                                             SharedGroup::durability_Full;
+        _sharedGroup = make_unique<SharedGroup>(*_replication, durability);
+        _sharedGroup->begin_read();
+
+        _path = path;
+        _realms = [NSMutableArray array];
+        _sharedGroupCondition = [[NSCondition alloc] init];
+        [self start];
+    }
+    return self;
+}
+
+// must be called with s_listenersPerPath locked
+- (void)addRealm:(RLMRealm *)realm {
+    [_sharedGroupCondition lock];
+    [_realms addObject:[[RLMWeakNotifier alloc] initWithRealm:realm]];
+    [_sharedGroupCondition unlock];
+}
+
+// must be called with s_listenersPerPath locked
+- (void)removeRealm:(RLMRealm *)realm {
+    [_sharedGroupCondition lock];
+
+    // The NSPredicate needs to be deallocated before we return or it crashes,
+    // since we're called from -dealloc and so retaining `realm` doesn't work.
+    @autoreleasepool {
+        [_realms filterUsingPredicate:[NSPredicate predicateWithFormat:@"realm != nil AND realm != %@", realm]];
+    }
+
+    // shut down if there's no longer any RLMRealms alive for this path
+    if (_realms.count == 0) {
+        if (_sharedGroup)
+        _sharedGroup->wait_for_change_enable(false);
+        // wait for the thread to wake up tear down the SharedGroup to ensure
+        // that it doesn't continue to care about the files on disk after the
+        // last RLMRealm instance for them is deallocated
+        while (_sharedGroup) {
+            [_sharedGroupCondition wait];
+        }
+
+        [s_listenersPerPath removeObjectForKey:_path];
+    }
+
+    [_sharedGroupCondition unlock];
+}
+
+- (void)run {
+    while (true) {
+        // Returns false if it was woken up by wait_for_change_enable(false)
+        // rather than a change occuring
+        if (!_sharedGroup->wait_for_change()) {
+            [_sharedGroupCondition lock];
+            _sharedGroup.reset();
+            _replication.reset();
+            [_sharedGroupCondition signal];
+            [_sharedGroupCondition unlock];
+            return;
+        }
+
+        // FIXME: advance_read fails on transactions which call RLMCreateTables
+        _sharedGroup->end_read();
+        _sharedGroup->begin_read();
+
+        @autoreleasepool {
+            [_sharedGroupCondition lock];
+            for (RLMWeakNotifier *notifier in _realms) {
+                [notifier notifyOnTargetThread];
+            }
+            [_sharedGroupCondition unlock];
+        }
+    }
 }
 @end
